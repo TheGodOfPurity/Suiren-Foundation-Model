@@ -558,3 +558,330 @@ class UniTransformerO2TwoUpdateGeneral(nn.Module):
             outputs["all_x"] = all_x
             outputs["all_h"] = all_h
         return outputs
+
+
+class TimeConditioning(nn.Module):
+    """Lightweight time conditioning for node/bond hidden states."""
+
+    def __init__(self, hidden_dim: int) -> None:
+        super().__init__()
+        self.net = nn.Sequential(
+            nn.Linear(1, hidden_dim),
+            nn.SiLU(),
+            nn.Linear(hidden_dim, hidden_dim),
+        )
+
+    def forward(self, t: torch.Tensor | None, target_dim: int) -> torch.Tensor | None:
+        if t is None:
+            return None
+        if t.dim() == 1:
+            t = t.unsqueeze(-1)
+        if t.size(-1) != 1:
+            t = t[..., :1]
+        emb = self.net(t)
+        if emb.size(-1) != target_dim:
+            raise ValueError(f"Time embedding dim {emb.size(-1)} != target dim {target_dim}")
+        return emb
+
+
+class BondRefineLayer(nn.Module):
+    """
+    Bond branch used together with the EST node backbone.
+
+    It updates bond hidden states from endpoint node states and bond geometry, then
+    feeds bond messages back to nodes and predicts a bond-induced coordinate delta.
+    """
+
+    def __init__(
+        self,
+        hidden_dim: int,
+        num_r_gaussian: int,
+        dropout: float = 0.0,
+    ) -> None:
+        super().__init__()
+        self.distance_expansion = GaussianSmearing(
+            start=0.0,
+            stop=10.0,
+            num_gaussians=num_r_gaussian,
+            basis_width_scalar=2.0,
+        )
+        bond_input_dim = hidden_dim * 3 + num_r_gaussian
+        self.bond_update = nn.Sequential(
+            nn.Linear(bond_input_dim, hidden_dim),
+            nn.SiLU(),
+            nn.Dropout(dropout),
+            nn.Linear(hidden_dim, hidden_dim),
+        )
+        self.node_message = nn.Sequential(
+            nn.Linear(hidden_dim, hidden_dim),
+            nn.SiLU(),
+            nn.Dropout(dropout),
+            nn.Linear(hidden_dim, hidden_dim),
+        )
+        self.coord_gate = nn.Sequential(
+            nn.Linear(hidden_dim + num_r_gaussian, hidden_dim),
+            nn.SiLU(),
+            nn.Linear(hidden_dim, 1),
+        )
+        self.norm_bond = nn.LayerNorm(hidden_dim)
+        self.norm_node = nn.LayerNorm(hidden_dim)
+
+    def forward(
+        self,
+        h_node: torch.Tensor,
+        pos: torch.Tensor,
+        h_bond: torch.Tensor,
+        bond_index: torch.Tensor,
+        mask_ligand: torch.Tensor,
+        fix_x: bool = False,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        num_nodes = h_node.size(0)
+        if bond_index.numel() == 0 or h_bond.numel() == 0:
+            zero_node = torch.zeros_like(h_node)
+            zero_pos = torch.zeros_like(pos)
+            return zero_node, h_bond, zero_pos
+
+        src, dst = bond_index
+        rel = pos[dst] - pos[src]
+        dist = torch.norm(rel, p=2, dim=-1, keepdim=True)
+        dist_feat = self.distance_expansion(dist)
+
+        bond_input = torch.cat([h_node[src], h_node[dst], h_bond, dist_feat], dim=-1)
+        bond_delta = self.bond_update(bond_input)
+        h_bond = self.norm_bond(h_bond + bond_delta)
+
+        node_msg = self.node_message(h_bond)
+        node_ctx = torch.zeros_like(h_node)
+        node_ctx.index_add_(0, src, node_msg)
+        node_ctx.index_add_(0, dst, node_msg)
+
+        degree = torch.zeros(num_nodes, 1, device=h_node.device, dtype=h_node.dtype)
+        one = torch.ones(src.size(0), 1, device=h_node.device, dtype=h_node.dtype)
+        degree.index_add_(0, src, one)
+        degree.index_add_(0, dst, one)
+        node_ctx = node_ctx / degree.clamp_min(1.0)
+        node_ctx = self.norm_node(node_ctx)
+
+        bond_gate = torch.tanh(self.coord_gate(torch.cat([h_bond, dist_feat], dim=-1)))
+        bond_delta_pos = bond_gate * rel
+        delta_pos = torch.zeros_like(pos)
+        delta_pos.index_add_(0, dst, bond_delta_pos)
+        delta_pos.index_add_(0, src, -bond_delta_pos)
+        if fix_x:
+            delta_pos = torch.zeros_like(delta_pos)
+        else:
+            delta_pos = delta_pos * mask_ligand.to(delta_pos.dtype).unsqueeze(-1)
+
+        return node_ctx, h_bond, delta_pos
+
+
+class UniTransformerO2TwoUpdateGeneralBond(UniTransformerO2TwoUpdateGeneral):
+    """
+    EST / Equiformer based backbone with an additional bond branch.
+
+    Compatible target interface:
+        outputs = model(
+            h, x, group_idx, bond_index, h_bond, mask_ligand, batch,
+            node_time, bond_time, include_protein, return_all=False
+        )
+        x, h, h_bond = outputs["x"], outputs["h"], outputs["h_bond"]
+    """
+
+    def __init__(
+        self,
+        num_blocks: int,
+        num_layers: int,
+        hidden_dim: int,
+        n_heads: int = 1,
+        knn: int = 32,
+        num_bond_classes: int = 1,
+        num_r_gaussian: int = 50,
+        edge_feat_dim: int = 4,
+        act_fn: str = "silu",
+        norm: bool = True,
+        cutoff_mode: str = "radius",
+        use_global_ew: bool = True,
+        adaptive_norm: bool = True,
+        r_max: float = 10.0,
+        x2h_out_fc: bool = True,
+        sync_twoup: bool = False,
+        h_node_in_bond_net: bool = False,
+        name: str = "unio2_net_bond",
+        bond_net_type: str = "mlp",
+        dropout: float = 0.1,
+        **kwargs,
+    ) -> None:
+        super().__init__(
+            num_blocks=num_blocks,
+            num_layers=num_layers,
+            hidden_dim=hidden_dim,
+            n_heads=n_heads,
+            knn=knn,
+            num_r_gaussian=num_r_gaussian,
+            edge_feat_dim=edge_feat_dim,
+            act_fn=act_fn,
+            norm=norm,
+            cutoff_mode=cutoff_mode,
+            r_max=r_max,
+            x2h_out_fc=x2h_out_fc,
+            sync_twoup=sync_twoup,
+            name=name,
+            **kwargs,
+        )
+        self.num_bond_classes = num_bond_classes
+        self.use_global_ew = use_global_ew
+        self.adaptive_norm = adaptive_norm
+        self.h_node_in_bond_net = h_node_in_bond_net
+        self.bond_net_type = bond_net_type
+        self.dropout = dropout
+
+        if self.use_global_ew:
+            self.edge_pred_layer = nn.Sequential(
+                nn.Linear(num_r_gaussian, hidden_dim),
+                nn.SiLU(),
+                nn.Linear(hidden_dim, 1),
+            )
+        else:
+            self.edge_pred_layer = None
+
+        self.bond_layers = nn.ModuleList(
+            [
+                BondRefineLayer(
+                    hidden_dim=hidden_dim,
+                    num_r_gaussian=num_r_gaussian,
+                    dropout=dropout,
+                )
+                for _ in range(self.num_layers)
+            ]
+        )
+        self.node_bond_fuse = nn.ModuleList(
+            [
+                nn.Sequential(
+                    nn.Linear(hidden_dim * 2, hidden_dim),
+                    nn.SiLU(),
+                    nn.Dropout(dropout),
+                    nn.Linear(hidden_dim, hidden_dim),
+                )
+                for _ in range(self.num_layers)
+            ]
+        )
+        self.node_time = TimeConditioning(hidden_dim) if adaptive_norm else None
+        self.bond_time = TimeConditioning(hidden_dim) if adaptive_norm else None
+
+    def _inject_hidden_into_so3(
+        self,
+        x_embed: SO3_Embedding,
+        h: torch.Tensor,
+    ) -> SO3_Embedding:
+        projected = self.input_proj(h)
+        coeff_offset = 0
+        scalar_offset = 0
+        for lmax in self.lmax_list:
+            x_embed.embedding[:, coeff_offset, :] = projected[
+                :, scalar_offset : scalar_offset + self.sphere_channels
+            ]
+            coeff_offset += (lmax + 1) ** 2
+            scalar_offset += self.sphere_channels
+        return x_embed
+
+    def forward(
+        self,
+        h: torch.Tensor,
+        x: torch.Tensor,
+        group_idx: torch.Tensor | None,
+        bond_index: torch.Tensor,
+        h_bond: torch.Tensor,
+        mask_ligand: torch.Tensor,
+        batch: torch.Tensor,
+        node_time: torch.Tensor | None,
+        bond_time: torch.Tensor | None,
+        include_protein: bool,
+        return_all: bool = False,
+        fix_x: bool = False,
+    ) -> dict[str, torch.Tensor | list[torch.Tensor]]:
+        del group_idx
+
+        mask_ligand = mask_ligand.to(device=x.device)
+        batch = batch.to(device=x.device)
+        dummy_atomic_numbers = torch.zeros(
+            x.size(0), dtype=torch.long, device=x.device
+        )
+
+        all_x = [x]
+        all_h = [h]
+        all_h_bond = [h_bond]
+
+        current_pos = x
+        current_h = h
+        current_h_bond = h_bond
+        x_embed = self._init_so3_embedding(current_h)
+
+        node_time_emb = self.node_time(node_time, self.hidden_dim) if self.node_time else None
+        bond_time_emb = self.bond_time(bond_time, self.hidden_dim) if self.bond_time else None
+
+        for _ in range(self.num_blocks):
+            if include_protein:
+                edge_index = self._connect_edge(current_pos, batch)
+                src, dst = edge_index
+                if self.edge_pred_layer is not None:
+                    dist = torch.norm(current_pos[dst] - current_pos[src], p=2, dim=-1, keepdim=True)
+                    dist_feat = self.distance_expansion(dist)
+                    e_w = torch.sigmoid(self.edge_pred_layer(dist_feat))
+                else:
+                    e_w = None
+            else:
+                edge_index = None
+                e_w = None
+
+            for layer_idx, layer in enumerate(self.base_block):
+                if node_time_emb is not None:
+                    current_h = current_h + node_time_emb
+                if bond_time_emb is not None and current_h_bond.numel() > 0:
+                    current_h_bond = current_h_bond + bond_time_emb
+
+                if include_protein and edge_index is not None:
+                    edge_scalar = self._build_edge_scalar(current_pos, edge_index, mask_ligand)
+                    if e_w is not None:
+                        edge_scalar = edge_scalar * e_w
+                    x_embed, current_pos = layer(
+                        x_embed=x_embed,
+                        pos=current_pos,
+                        edge_index=edge_index,
+                        edge_scalar=edge_scalar,
+                        batch=batch,
+                        mask_ligand=mask_ligand,
+                        dummy_atomic_numbers=dummy_atomic_numbers,
+                        fix_x=fix_x,
+                    )
+                    current_h = self._decode_hidden(x_embed, current_h)
+                else:
+                    x_embed = self._inject_hidden_into_so3(x_embed, current_h)
+
+                bond_ctx, current_h_bond, bond_delta_pos = self.bond_layers[layer_idx](
+                    h_node=current_h,
+                    pos=current_pos,
+                    h_bond=current_h_bond,
+                    bond_index=bond_index,
+                    mask_ligand=mask_ligand,
+                    fix_x=fix_x,
+                )
+                fused = self.node_bond_fuse[layer_idx](torch.cat([current_h, bond_ctx], dim=-1))
+                current_h = current_h + fused
+                current_pos = current_pos + bond_delta_pos
+                x_embed = self._inject_hidden_into_so3(x_embed, current_h)
+
+                if return_all:
+                    all_x.append(current_pos)
+                    all_h.append(current_h)
+                    all_h_bond.append(current_h_bond)
+
+        outputs: dict[str, torch.Tensor | list[torch.Tensor]] = {
+            "x": current_pos,
+            "h": current_h,
+            "h_bond": current_h_bond,
+        }
+        if return_all:
+            outputs["all_x"] = all_x
+            outputs["all_h"] = all_h
+            outputs["all_h_bond"] = all_h_bond
+        return outputs
